@@ -280,11 +280,35 @@ export const CHROMA_GROUP = 8;
  * Края — повтором крайнего пикселя. Выход rgba16float (rg16float нет среди
  * базовых форматов storage-текстур), заняты xy.
  */
-export function chromaShader(axis: 'x' | 'y', sigma: number): string {
+export function chromaShader(axis: 'x' | 'y', sigma: number, threshold = 0): string {
   const taps = gaussTaps(sigma);
   const radius = (taps.length - 1) / 2;
-  const read = axis === 'x' ? 'toChroma(textureLoad(src, q, 0).rgb)' : 'textureLoad(src, q, 0).xy';
+  const at = (q: string) => (axis === 'x' ? `toChroma(textureLoad(src, ${q}, 0).rgb)` : `textureLoad(src, ${q}, 0).xy`);
   const step = axis === 'x' ? 'vec2i(k, 0)' : 'vec2i(0, k)';
+  // С порогом — двусторонний вес (Э27): отсчёт, чья цветность дальше от
+  // своей на порядок `threshold`, почти не берётся. Блоки сжатия — мелкие
+  // перепады, сглаживаются как раньше; цветная линия и край заливки — нет.
+  const body = threshold > 0
+    ? `  let c = ${at('p')};
+  var sum = vec2f(0.0);
+  var norm = 0.0;
+  for (var i = 0; i < ${taps.length}; i++) {
+    let k = i - ${radius};
+    let q = clamp(p + ${step}, vec2i(0), size - 1);
+    let v = ${at('q')};
+    let d = v - c;
+    let w = TAPS[i] * exp(-dot(d, d) * ${(1 / (2 * threshold * threshold)).toFixed(4)});
+    sum += w * v;
+    norm += w;
+  }
+  textureStore(dst, p, vec4f(sum / norm, 0.0, 1.0));`
+    : `  var sum = vec2f(0.0);
+  for (var i = 0; i < ${taps.length}; i++) {
+    let k = i - ${radius};
+    let q = clamp(p + ${step}, vec2i(0), size - 1);
+    sum += TAPS[i] * ${at('q')};
+  }
+  textureStore(dst, p, vec4f(sum, 0.0, 1.0));`;
   return `${CHROMA_WGSL}
 
 const TAPS = array<f32, ${taps.length}>(${taps.map((w) => w.toFixed(8)).join(', ')});
@@ -297,13 +321,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   let size = vec2i(textureDimensions(src));
   let p = vec2i(id.xy);
   if (p.x >= size.x || p.y >= size.y) { return; }
-  var sum = vec2f(0.0);
-  for (var i = 0; i < ${taps.length}; i++) {
-    let k = i - ${radius};
-    let q = clamp(p + ${step}, vec2i(0), size - 1);
-    sum += TAPS[i] * ${read};
-  }
-  textureStore(dst, p, vec4f(sum, 0.0, 1.0));
+${body}
 }
 `;
 }

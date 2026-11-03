@@ -35,6 +35,13 @@ export interface CompactPipelineDescriptor {
    * рисует пятнами, как детали; σ = 2 их убирает (docs/PLAN.md, Э12).
    */
   chromaSigma?: number;
+  /**
+   * Порог сглаживания цветности (доли 0..1 по Cb/Cr), 0 — без порога, как в
+   * Э12. Больше нуля — двусторонний вес: перепады цвета крупнее порога не
+   * усредняются, и цветная линия на фоне той же яркости не расплывается в
+   * ореол. 0.02 — блоки гаснут как при σ2, края втрое резче (Э27).
+   */
+  chromaThreshold?: number;
   name?: string;
 }
 
@@ -65,7 +72,7 @@ export class CompactSR implements Anime4KPipeline {
   private launch: Launch;
 
   constructor({
-    device, inputTexture, model, kernel = 'fast', gate, chromaSigma = 0, name = 'CompactSR',
+    device, inputTexture, model, kernel = 'fast', gate, chromaSigma = 0, chromaThreshold = 0, name = 'CompactSR',
   }: CompactPipelineDescriptor) {
     this.name = name;
     const { meta, weights } = model;
@@ -145,7 +152,7 @@ export class CompactSR implements Anime4KPipeline {
           label: `${name}: chroma ${axis}`,
           layout: 'auto',
           compute: {
-            module: device.createShaderModule({ label: `${name}: chroma ${axis}`, code: chromaShader(axis, chromaSigma) }),
+            module: device.createShaderModule({ label: `${name}: chroma ${axis}`, code: chromaShader(axis, chromaSigma, chromaThreshold) }),
             entryPoint: 'main',
           },
         }).then((pipeline) => {

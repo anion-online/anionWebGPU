@@ -23,6 +23,11 @@ export interface ModeCompactPresetPipelineDescriptor extends Anime4KPresetPipeli
    */
   chromaSigma?: number;
   /**
+   * Порог сглаживания цветности (Э27): по умолчанию 0 — как в 1.x. 0.02 —
+   * цветные линии не расплываются. См. CompactPipelineDescriptor.
+   */
+  chromaThreshold?: number;
+  /**
    * Дебандинг до сети (Э21): `true` — с параметрами по умолчанию, объект —
    * со своими. По умолчанию выключен: выход тот же, что в 1.x.
    */
@@ -55,7 +60,7 @@ export class ModeCompact implements Anime4KPipeline {
 
   constructor({
     device, inputTexture, nativeDimensions, targetDimensions, model, kernel,
-    skipUnchanged = false, unchangedThreshold = 0, chromaSigma = 2, deband, restore,
+    skipUnchanged = false, unchangedThreshold = 0, chromaSigma = 2, chromaThreshold = 0, deband, restore,
   }: ModeCompactPresetPipelineDescriptor) {
     let currentTexture = inputTexture;
     if (targetDimensions.width > 1.2 * nativeDimensions.width
@@ -84,7 +89,7 @@ export class ModeCompact implements Anime4KPipeline {
       }
 
       const upscale = new CompactSR({
-        device, inputTexture: currentTexture, model, kernel, gate, chromaSigma,
+        device, inputTexture: currentTexture, model, kernel, gate, chromaSigma, chromaThreshold,
       });
       this.pipelines.push(upscale);
       currentTexture = upscale.getOutputTexture();
