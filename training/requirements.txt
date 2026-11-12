@@ -1,0 +1,21 @@
+# Окружение обучения: python3.14 -m venv .venv && .venv/bin/pip install -r requirements.txt
+# Версии — как в рабочем окружении 2026-10 (Э1–Э27).
+torch==2.14.1
+torchvision==0.29.1
+numpy==2.5.3
+scipy==1.18.1
+scikit-image==0.26.0
+opencv-python-headless==5.0.0.93
+pillow==12.3.0
+spandrel==0.4.2
+safetensors==0.8.0
+einops==0.8.2
+onnx==1.23.2
+onnxruntime==1.30.0
+huggingface_hub==2.1.1
+wgpu==0.32.0
+rendercanvas==2.7.2
+av==19.0.1
+imageio==2.38.0
+tqdm==4.70.1
+pyyaml==6.0.3

@@ -4,6 +4,7 @@
     python train.py --init model.onnx --run runs/<имя> [--iters 30000]
     python train.py --arch u48x7r --run runs/<имя> --teacher 1 --ink 8 [--data train128]
     python train.py --arch u48x7 --from runs/<сеть>/it100000.pt … --text train128-text  # надписи, Э22
+    python train.py --arch u48x7 --from runs/u48-rcan-ft/it25000.pt … --al anilibria  # 1080p, Э28
 
 Стартует с весов ONNX (AnimeJaNai V2 SUC — то, что сейчас в «Деталях»),
 учится на `data/train/{lq,gt}.npy` (`make_pairs.py`, грузятся в память), каждые `--every`
@@ -234,6 +235,23 @@ def clean_input(gt: torch.Tensor) -> torch.Tensor:
     return F.avg_pool2d(gt, 2)
 
 
+def area_matrix(n_in: int, n_out: int, device: torch.device) -> torch.Tensor:
+    """(n_out, n_in): усреднение по площади при уменьшении n_in → n_out, в том
+    числе дробном (4 → 3 у выхода ×2 против эталона 1.5×, Э28). Матрицей, а не
+    `adaptive_avg_pool2d`: та на MPS берёт только кратные размеры."""
+    edges = torch.arange(n_out + 1, dtype=torch.float64) * n_in / n_out
+    lo, hi = edges[:-1, None], edges[1:, None]
+    x = torch.arange(n_in, dtype=torch.float64)[None]
+    overlap = (torch.minimum(hi, x + 1) - torch.maximum(lo, x)).clamp(min=0)
+    return (overlap / overlap.sum(1, keepdim=True)).float().to(device)
+
+
+def area_down(x: torch.Tensor, size: int) -> torch.Tensor:
+    """Квадратный (…, C, H, H) → (…, C, size, size) усреднением по площади."""
+    a = area_matrix(x.shape[-1], size, x.device)
+    return a @ x @ a.T
+
+
 def psnr(a: torch.Tensor, b: torch.Tensor) -> float:
     return 10 * math.log10(1 / F.mse_loss(a[..., 8:-8, 8:-8], b[..., 8:-8, 8:-8]).item())
 
@@ -267,6 +285,21 @@ def validate_text(model: nn.Module, text: dict[str, np.ndarray], device: torch.d
             weight += m.sum().item() * 3
     model.train()
     return 10 * math.log10(weight / se)
+
+
+def validate_al(model: nn.Module, al: dict[str, np.ndarray], device: torch.device) -> float:
+    """PSNR на проверочных сериях AniLibria (Э28): выход ×2, уменьшенный до 1.5×,
+    против кадра 1080p."""
+    model.eval()
+    se, n = 0.0, 0
+    with torch.no_grad():
+        for i in range(0, len(al["val_lq"]), 16):
+            gt = to_tensor(al["val_gt"][i : i + 16], device)
+            out = area_down(model(to_tensor(al["val_lq"][i : i + 16], device)).clamp(0, 1), gt.shape[-1])
+            se += F.mse_loss(out[..., 8:-8, 8:-8], gt[..., 8:-8, 8:-8], reduction="sum").item()
+            n += gt[..., 8:-8, 8:-8].numel()
+    model.train()
+    return 10 * math.log10(n / se)
 
 
 def export(model: Compact, path: Path) -> None:
@@ -335,6 +368,13 @@ def main() -> None:
         default=0.0,
         help="вес L1 между энергиями полосы σ0.75–3 по участкам выхода и эталона (band_energy): против «акварели»",
     )
+    p.add_argument(
+        "--al",
+        help="каталог фрагментов AniLibria в data/ (`anilibria_pairs.py --pack`, Э28): цель — кадр 1080p, "
+        "с ним сравнивается выход, уменьшенный до 1.5× входа",
+    )
+    p.add_argument("--al-share", type=float, default=0.25, help="доля батча из пар AniLibria")
+    p.add_argument("--al-weight", type=float, default=1.0, help="вес потерь на парах AniLibria")
     p.add_argument("--from", dest="start", type=Path, help="начать с чекпойнта .pt вместо --init")
     p.add_argument("--every", type=int, default=2_000)
     p.add_argument("--mmap", action="store_true", help="данные через memmap, не в память")
@@ -387,6 +427,21 @@ def main() -> None:
         say(f"пар с надписями: {len(text['lq'])} ({args.text}), в батче {n_text} из {args.batch}; "
             "текст в логе — PSNR по маске надписи на проверочных шрифтах")
         say(f"текст {validate_text(model, text, device):.3f} дБ")
+    al = None
+    n_al = 0
+    if args.al:
+        al = {k: np.load(DATA / args.al / part / f"{name}.npy")
+              for k, part, name in (("lq", "train", "lq"), ("gt", "train", "gt"),
+                                    ("val_lq", "val", "lq"), ("val_gt", "val", "gt"))}
+        if al["lq"].shape[1] != lq_all.shape[1]:
+            raise SystemExit(f"--al: вход {al['lq'].shape[1]} px, а у {args.data} — {lq_all.shape[1]}")
+        n_al = round(args.batch * args.al_share)
+        say(f"пар AniLibria: {len(al['lq'])} ({args.al}, эталон {al['gt'].shape[1]} px), "
+            f"в батче {n_al} из {args.batch}, вес {args.al_weight}")
+        say(f"AniLibria {validate_al(model, al, device):.3f} дБ")
+    # Свой генератор: без --al поток `rng` тот же, что раньше, и старые прогоны
+    # воспроизводятся.
+    al_rng = np.random.default_rng(1)
 
     opt = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.99))
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.iters, eta_min=args.lr / 100)
@@ -395,9 +450,10 @@ def main() -> None:
     started = time.time()
     running = 0.0
     texture_running = 0.0
+    al_running = 0.0
 
     for it in range(1, args.iters + 1):
-        idx = np.sort(rng.choice(len(lq_all), args.batch - n_text, replace=False))
+        idx = np.sort(rng.choice(len(lq_all), args.batch - n_text - n_al, replace=False))
         lq = to_tensor(lq_all[idx], device)
         gt = to_tensor(gt_all[idx], device)
         pre = to_tensor(cached[idx], device) if cached is not None else None
@@ -416,8 +472,17 @@ def main() -> None:
                 lq, gt = flip(lq), flip(gt)
                 pre = flip(pre) if pre is not None else None
                 boost = flip(boost) if boost is not None else None
-
-        out = model(lq)
+        if al is not None:
+            aidx = np.sort(al_rng.choice(len(al["lq"]), n_al, replace=False))
+            al_lq = to_tensor(al["lq"][aidx], device)
+            al_gt = to_tensor(al["gt"][aidx], device)
+            for flip in (lambda t: t.flip(-1), lambda t: t.flip(-2), lambda t: t.transpose(-1, -2)):
+                if al_rng.random() < 0.5:
+                    al_lq, al_gt = flip(al_lq), flip(al_gt)
+            out_all = model(torch.cat([lq, al_lq]))
+            out, al_out = out_all[: len(lq)], area_down(out_all[len(lq) :], al_gt.shape[-1])
+        else:
+            out = model(lq)
         loss = 0.0
         if args.teacher < 1:
             w = ink_weight(gt, args.ink) if args.ink else None
@@ -433,6 +498,14 @@ def main() -> None:
             tex = F.l1_loss(band_energy(out), band_energy(gt))
             loss = loss + args.texture * tex
             texture_running += tex.item()
+        if al is not None:
+            # Средние по своим частям батча, сложенные в долях батча: на старой
+            # части те же потери, что без --al.
+            w = ink_weight(al_gt, args.ink) if args.ink else None
+            al_loss = wl1(al_out, al_gt, w) + args.edge * wl1(sobel(al_out), sobel(al_gt), w)
+            share = n_al / args.batch
+            loss = (1 - share) * loss + share * args.al_weight * al_loss
+            al_running += al_loss.item()
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
@@ -442,8 +515,9 @@ def main() -> None:
         if it % 200 == 0:
             rate = it / (time.time() - started)
             tail = f"  фактура {texture_running / 200:.5f}" if args.texture else ""
+            tail += f"  AniLibria {al_running / 200:.5f}" if al is not None else ""
             say(f"{it:>6}  loss {running / 200:.5f}{tail}  lr {sched.get_last_lr()[0]:.2e}  {rate:.1f} it/s")
-            running = texture_running = 0.0
+            running = texture_running = al_running = 0.0
         if it % args.every == 0 or it == args.iters:
             vs_gt, vs_teacher = validate(model, teacher, device)
             # «Лучший» — по той цели, к которой модель и тянется.
@@ -458,6 +532,7 @@ def main() -> None:
                 torch.save(state, args.run / "best.pt")
                 mark = "  ← лучший"
             tail = f", текст {validate_text(model, text, device):.3f} дБ" if text is not None else ""
+            tail += f", AniLibria {validate_al(model, al, device):.3f} дБ" if al is not None else ""
             say(f"{it:>6}  val PSNR к эталону {vs_gt:.3f} дБ, к учителю {vs_teacher:.3f} дБ{tail}{mark}")
 
     model = build(plain_arch)
