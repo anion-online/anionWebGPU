@@ -5,6 +5,7 @@
     python train.py --arch u48x7r --run runs/<имя> --teacher 1 --ink 8 [--data train128]
     python train.py --arch u48x7 --from runs/<сеть>/it100000.pt … --text train128-text  # надписи, Э22
     python train.py --arch u48x7 --from runs/u48-rcan-ft/it25000.pt … --al anilibria  # 1080p, Э28
+    python train.py … --al anilibria --al-cache teacher-c-sd3-r075.npy --al-share 0.5  # учителя на 720p, Э29
 
 Стартует с весов ONNX (AnimeJaNai V2 SUC — то, что сейчас в «Деталях»),
 учится на `data/train/{lq,gt}.npy` (`make_pairs.py`, грузятся в память), каждые `--every`
@@ -373,6 +374,11 @@ def main() -> None:
         help="каталог фрагментов AniLibria в data/ (`anilibria_pairs.py --pack`, Э28): цель — кадр 1080p, "
         "с ним сравнивается выход, уменьшенный до 1.5× входа",
     )
+    p.add_argument(
+        "--al-cache",
+        help="npy в `<--al>/train` с выходами учителя на чистом 720p (`teacher_cache.py … clean`, Э29): "
+        "цель пар AniLibria — он (×2, как у основной части), а не кадр 1080p",
+    )
     p.add_argument("--al-share", type=float, default=0.25, help="доля батча из пар AniLibria")
     p.add_argument("--al-weight", type=float, default=1.0, help="вес потерь на парах AniLibria")
     p.add_argument("--from", dest="start", type=Path, help="начать с чекпойнта .pt вместо --init")
@@ -433,10 +439,13 @@ def main() -> None:
         al = {k: np.load(DATA / args.al / part / f"{name}.npy")
               for k, part, name in (("lq", "train", "lq"), ("gt", "train", "gt"),
                                     ("val_lq", "val", "lq"), ("val_gt", "val", "gt"))}
+        if args.al_cache:
+            al["target"] = np.load(DATA / args.al / "train" / args.al_cache)
         if al["lq"].shape[1] != lq_all.shape[1]:
             raise SystemExit(f"--al: вход {al['lq'].shape[1]} px, а у {args.data} — {lq_all.shape[1]}")
         n_al = round(args.batch * args.al_share)
-        say(f"пар AniLibria: {len(al['lq'])} ({args.al}, эталон {al['gt'].shape[1]} px), "
+        goal = f"цель {args.al_cache}" if args.al_cache else f"эталон {al['gt'].shape[1]} px"
+        say(f"пар AniLibria: {len(al['lq'])} ({args.al}, {goal}), "
             f"в батче {n_al} из {args.batch}, вес {args.al_weight}")
         say(f"AniLibria {validate_al(model, al, device):.3f} дБ")
     # Свой генератор: без --al поток `rng` тот же, что раньше, и старые прогоны
@@ -475,12 +484,15 @@ def main() -> None:
         if al is not None:
             aidx = np.sort(al_rng.choice(len(al["lq"]), n_al, replace=False))
             al_lq = to_tensor(al["lq"][aidx], device)
-            al_gt = to_tensor(al["gt"][aidx], device)
+            # Цель — кадр 1080p (выход уменьшается до него) или кэш учителя ×2.
+            al_gt = to_tensor((al["target"] if args.al_cache else al["gt"])[aidx], device)
             for flip in (lambda t: t.flip(-1), lambda t: t.flip(-2), lambda t: t.transpose(-1, -2)):
                 if al_rng.random() < 0.5:
                     al_lq, al_gt = flip(al_lq), flip(al_gt)
             out_all = model(torch.cat([lq, al_lq]))
-            out, al_out = out_all[: len(lq)], area_down(out_all[len(lq) :], al_gt.shape[-1])
+            out, al_out = out_all[: len(lq)], out_all[len(lq) :]
+            if al_out.shape[-1] != al_gt.shape[-1]:
+                al_out = area_down(al_out, al_gt.shape[-1])
         else:
             out = model(lq)
         loss = 0.0

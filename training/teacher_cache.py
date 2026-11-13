@@ -7,6 +7,7 @@
     python teacher_cache.py runs/u48r-compact/it80000.pt train128 teacher-u48-2-lq.npy lq
     python teacher_cache.py runs/u48r-csdaulq/it100000.pt train128 teacher-u48-3-restore.npy lq-restore
     python teacher_cache.py ink train128 teacher-c-sd3-a075k5.npy teacher-u48-2.npy teacher-c-sd3-a075k5-u.npy
+    python teacher_cache.py data/teachers/sharp4/model.safetensors anilibria/train teacher-rcan.npy clean
 
 Цель обучения с `--teacher 1` — учитель на эталоне, уменьшенном 2×2
 (`clean_input`). AnimeJaNai V2 Compact (64nf/16nc) в 6.5 раза тяжелее SUC —
@@ -21,7 +22,9 @@ uint8 BGR той же формы, что `gt.npy` (округление до у�
 Последний аргумент `lq` — учитель на порченом входе пары (`lq.npy`), как
 ученик и как на Kodik; `lq-restore` — то же, но вход сперва проходит Restore
 CNNM из Anime4K (Э23: цель «U48-3 после Restore» для дистилляции): так считаются линии U48-2 для `ink` — на чистом входе
-она рисует штрих тоньше, чем может повторить ученик (Э20).
+она рисует штрих тоньше, чем может повторить ученик (Э20). `clean` — учитель
+на готовом чистом входе `clean.npy` (пары AniLibria, Э29: кадр 1080p↓area до
+720p; эталон там в 1.5×, а не ×2, и `clean_input` к нему не подходит).
 
 `blend` складывает цель из двух кэшей (Э20): низ первого + верх второго —
 `lo(a) + k·(b − lo(b))`, lo — гаусс σ в пикселях выхода. Так от APISR берутся
@@ -97,19 +100,23 @@ def main() -> None:
         return
     model_path, data, name, *source = sys.argv[1:]
     from_lq = source in (["lq"], ["lq-restore"])
+    from_clean = source == ["clean"]
     restore = Anime4K("Anime4K_Restore_CNN_M.glsl") if source == ["lq-restore"] else None
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     teacher = load_teacher(Path(model_path)).to(device).eval()
     restore = restore.to(device) if restore is not None else None
     gt_all = np.load(DATA / data / "gt.npy", mmap_mode="r")
-    src_all = np.load(DATA / data / "lq.npy", mmap_mode="r") if from_lq else gt_all
-    out = np.lib.format.open_memmap(DATA / data / name, "w+", np.uint8, gt_all.shape)
+    src_all = np.load(DATA / data / ("lq.npy" if from_lq else "clean.npy"), mmap_mode="r") \
+        if from_lq or from_clean else gt_all
+    n, h, w, c = src_all.shape
+    shape = (n, 2 * h, 2 * w, c) if from_lq or from_clean else gt_all.shape
+    out = np.lib.format.open_memmap(DATA / data / name, "w+", np.uint8, shape)
     with torch.no_grad():
         for start in range(0, len(gt_all), BATCH):
             src = to_tensor(src_all[start : start + BATCH], device)
             if restore is not None:
                 src = restore(src).clamp(0, 1)
-            rgb = teacher(src if from_lq else clean_input(src)).clamp(0, 1).permute(0, 2, 3, 1)
+            rgb = teacher(src if from_lq or from_clean else clean_input(src)).clamp(0, 1).permute(0, 2, 3, 1)
             out[start : start + len(src)] = (rgb * 255 + 0.5).byte().cpu().numpy()[..., ::-1]
             if start // BATCH % 50 == 0:
                 print(f"{start}/{len(gt_all)}", flush=True)

@@ -247,7 +247,10 @@ def crop_xy(rng: np.random.Generator, size: int) -> tuple[int, int]:
 
 def pack(crops: int, val_crops: int) -> None:
     """Фрагменты из всех серий в `data/anilibria/{train,val}/{lq,gt}.npy` —
-    как `train128`, но эталон в 1.5× входа (128 → 192, проверка 256 → 384)."""
+    как `train128`, но эталон в 1.5× входа (128 → 192, проверка 256 → 384).
+    `clean.npy` — эталон, уменьшенный area до входа: чистый 720p для учителей
+    (`teacher_cache.py … clean`, Э29). Угол эталона кратен 3, так что это
+    ровно фрагмент кадра 1080p↓area."""
     role = {slug: r for slug, _, _, r in EPISODES}
     jobs: dict[str, list[tuple[Path, Path]]] = {"train": [], "val": []}
     for slug in sorted(role):
@@ -260,6 +263,7 @@ def pack(crops: int, val_crops: int) -> None:
         count = len(jobs[part]) * n
         lq_out = np.lib.format.open_memmap(out / "lq.npy", "w+", np.uint8, (count, size, size, 3))
         gt_out = np.lib.format.open_memmap(out / "gt.npy", "w+", np.uint8, (count, big, big, 3))
+        clean_out = np.lib.format.open_memmap(out / "clean.npy", "w+", np.uint8, (count, size, size, 3))
         rng = np.random.default_rng(0 if part == "train" else 1)
         i = 0
         for k, (lq_path, gt_path) in enumerate(jobs[part]):
@@ -270,11 +274,13 @@ def pack(crops: int, val_crops: int) -> None:
                 lq_out[i] = lq[y : y + size, x : x + size]
                 X, Y = x * 3 // 2, y * 3 // 2
                 gt_out[i] = gt[Y : Y + big, X : X + big]
+                clean_out[i] = cv2.resize(gt_out[i], (size, size), interpolation=cv2.INTER_AREA)
                 i += 1
             if k % 500 == 0:
                 print(f"{part} {k}/{len(jobs[part])}", flush=True)
         lq_out.flush()
         gt_out.flush()
+        clean_out.flush()
         print(f"{part}: {count} пар {size}→{big} из {len(jobs[part])} кадров-вариантов", flush=True)
 
 
